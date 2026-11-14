@@ -1,0 +1,35 @@
+{
+    "name": "Viggle.SplatEngine",
+    "rootNamespace": "Viggle.SplatEngine",
+    "references": [
+        "Viggle.SplatEngine.Jobs",
+        "GUID:4b653174f8fcdcd49b4c9a6f1ca8c7c3",
+        "Unity.Mathematics",
+        "Unity.Collections",
+        "Unity.Burst",
+        "GUID:8992d429105beaf428dfc91fb5b9f531",
+        "GUID:15fc0a57446b3144c949da3e2b9737a9",
+        "GUID:df380645f10b7bc4b97d4f5eb6303d95",
+        "GUID:457756d89b35d2941b3e7b37b4ece6f1"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.render-pipelines.universal",
+            "expression": "",
+            "define": "GS_ENABLE_URP"
+        },
+        {
+            "name": "com.unity.render-pipelines.high-definition",
+            "expression": "",
+            "define": "GS_ENABLE_HDRP"
+        }
+    ],
+    "noEngineReferences": false
+}

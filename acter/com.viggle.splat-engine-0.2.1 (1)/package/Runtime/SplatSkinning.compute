@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: MIT
+// Linear blend skinning for Gaussian splats. One kernel, run per frame:
+//   - position: blend the top-4 bone matrices, transform the bind-pose center.
+//   - rotation: blend the top-4 bone delta-quaternions (nlerp), apply to the
+//     bind-pose gaussian orientation.
+//
+// Matrix convention: Unity Matrix4x4 is column-major; uploaded into an HLSL
+// float4x4 it reads back transposed, so mul(vector, M) yields Unity's M * vector.
+// Bone delta-quats are extracted CPU-side via Matrix4x4.rotation (robust) and
+// blended here, avoiding matrix->quat on the GPU.
+//
+// SSBO budget: the eight logical buffers are packed so the kernel binds only 4
+// StructuredBuffers (2 in + 2 out). OpenGL ES 3.1 guarantees exactly 4 SSBOs per
+// compute stage, so this is the portable floor; older mobile GPUs (native Mali
+// GLES) rejected the original 8-buffer version with "Kernel at index (0) is
+// invalid". Positions are float4 (not float3) to dodge the std430 vec3-array
+// stride mismatch on GLES.
+
+#pragma kernel CSBoneSkinning
+#define GROUP_SIZE 128 // <=128: OpenGL ES 3.1 guaranteed workgroup-invocation floor (Mali-G72 caps here)
+
+// per-splat: bind center (pos.xyz), bind rotation (xyzw), top-4 bone indices + weights
+struct SplatBind { float4 pos; float4 rot; uint4 idx; float4 w; }; // 64 bytes
+struct BonePose  { float4x4 m; float4 dq; };                       // 80 bytes (matrix + delta-quat)
+
+StructuredBuffer<SplatBind> _SplatBind;  // per-splat bind pose + bone binding
+StructuredBuffer<BonePose>  _BonePose;   // per-bone palette (matrix + delta-quat)
+
+// float4, NOT float3 (.w unused): the vec3 stride mismatch that forced float4 on SplatBind.pos
+// applies to the OUTPUT buffers too, and bites harder here. HLSL/D3D gives a float3 structured
+// buffer a 12-byte stride, but MSL's float3 is 16 bytes, and this buffer is written here (legacy
+// translator, no #pragma use_dxc) and read by RenderGaussianSplats.shader / the outline sample
+// (DXC). If the two disagree, the write at index N-1 lands ~33% past a 12-byte-stride allocation,
+// which Metal reports as a GPU page fault (kIOGPUCommandBufferCallbackErrorPageFault) and renders
+// as garbage; D3D11 merely returned zeros, which is why it never showed on desktop. Stride must
+// stay 16 in SkinnedSplatRenderer.CreateBuffers and in the renderer's dummy buffers.
+RWStructuredBuffer<float4> _SkinPos;     // output skinned centers (xyz; consumed by the renderer)
+RWStructuredBuffer<float4> _SkinRot;     // output skinned rotations (xyzw)
+
+uint _SplatCount;
+// _BonePose's length. Passed as a uniform rather than queried with GetDimensions: Unity's non-DXC
+// translator rejects buffer size queries on Metal ("Metal shading language does not support buffer
+// size query from shader. Pass the size to shader as const instead").
+uint _BoneCount;
+
+// Hamilton product for xyzw quaternions: result = a * b (apply b, then a).
+float4 qmul(float4 a, float4 b)
+{
+    return float4(
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void CSBoneSkinning(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _SplatCount) return;
+
+    SplatBind sb = _SplatBind[i];
+    uint4  bi = sb.idx;
+    float4 w  = sb.w;
+
+    // Bone indices are already clamped CPU-side when _SplatBind is built, but clamp again here so
+    // the palette reads below are in-bounds no matter what reached the buffer (a future writer, a
+    // partially-written buffer). The reads happen before the weight multiply, so even a zero-weight
+    // "no bone" sentinel index is a real out-of-bounds read, which Metal faults on.
+    bi = min(bi, (uint4)(_BoneCount - 1u));
+
+    // ---- position: blend matrices, transform bind center ----
+    float4x4 M = w.x * _BonePose[bi.x].m
+               + w.y * _BonePose[bi.y].m
+               + w.z * _BonePose[bi.z].m
+               + w.w * _BonePose[bi.w].m;
+    float3 p = sb.pos.xyz;
+    _SkinPos[i] = float4(mul(M, float4(p, 1.0)).xyz, 1.0); // Unity matrix loads un-transposed: M * v
+
+    // ---- rotation: nlerp the delta-quats (hemisphere-aligned to the dominant bone) ----
+    float4 q0 = _BonePose[bi.x].dq;
+    float4 q1 = _BonePose[bi.y].dq;
+    float4 q2 = _BonePose[bi.z].dq;
+    float4 q3 = _BonePose[bi.w].dq;
+    q1 *= (dot(q0, q1) < 0.0) ? -1.0 : 1.0;
+    q2 *= (dot(q0, q2) < 0.0) ? -1.0 : 1.0;
+    q3 *= (dot(q0, q3) < 0.0) ? -1.0 : 1.0;
+    float4 q = normalize(w.x * q0 + w.y * q1 + w.z * q2 + w.w * q3);
+
+    _SkinRot[i] = normalize(qmul(q, sb.rot));
+}

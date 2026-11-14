@@ -1,0 +1,1347 @@
+// SPDX-License-Identifier: MIT
+// 128 = the OpenGL ES 3.1 guaranteed max compute workgroup invocations. Larger groups
+// (e.g. 1024) fail to compile on low-end mobile GPUs (Mali-G72 caps at 128, Mali-G57 at
+// 512) with "Kernel size exceeds device limits". These kernels are per-element and use no
+// groupshared memory, so the group size is pure tiling — dispatch counts adjust via
+// GetKernelThreadGroupSizes and results are identical.
+#define GROUP_SIZE 128
+
+#pragma kernel CSSetIndices
+#pragma kernel CSCalcDistances
+#pragma kernel CSCalcViewData
+#pragma kernel CSUpdateEditData
+#pragma kernel CSInitEditData
+#pragma kernel CSClearBuffer
+#pragma kernel CSInvertSelection
+#pragma kernel CSSelectAll
+#pragma kernel CSOrBuffers
+#pragma kernel CSSelectionUpdate
+#pragma kernel CSTranslateSelection
+#pragma kernel CSRotateSelection
+#pragma kernel CSScaleSelection
+#pragma kernel CSExportData
+#pragma kernel CSCopySplats
+// Packs per-splat view data into a texture for the vertex-texture-fetch render path (devices
+// whose GLES driver disallows StructuredBuffers in the vertex stage). Must stay before the
+// bitonic kernels: KernelIndices is positional up to here, bitonic kernels resolve by name.
+#pragma kernel CSBuildViewTex
+// Screen-size-cull compaction helpers. Positional in KernelIndices, so they MUST sit between
+// CSBuildViewTex and the by-name bitonic kernels below.
+#pragma kernel CSClearVisibleCounter
+#pragma kernel CSWriteDrawArgs
+// LOD on the bitonic-sort fallback: sentinel-fill of the sort-distance tail. Positional too;
+// keep right after CSWriteDrawArgs (the bitonic kernels below are looked up by name).
+#pragma kernel CSFillSortDistances
+// Bitonic sort fallback for platforms without wave intrinsics (e.g. OpenGL ES) — see
+// GpuBitonicSort.cs. Appended after the other kernels: KernelIndices is positional.
+#pragma kernel CSBitonicSortLocal
+#pragma kernel CSBitonicMergeGlobal
+#pragma kernel CSBitonicMergeLocal
+// Counting sort - the actual sort used on platforms without wave intrinsics, with the bitonic
+// network above kept only for 32-bit keys. Looked up by name, like the bitonic kernels, so
+// KernelIndices stays positional and undisturbed. See GpuCountingSort.cs.
+#pragma kernel CSCountClear
+#pragma kernel CSCountHistogram
+#pragma kernel CSCountBlockSums
+#pragma kernel CSCountScanBlockSums
+#pragma kernel CSCountBinOffsets
+#pragma kernel CSCountScatter
+#pragma kernel CSCountCopyBack
+// Unified (cross-object) sorting, off by default. Also by name, also after the positional block.
+#pragma kernel CSUnifiedBuildKeys
+#pragma kernel CSUnifiedBuildViewTex
+
+// Note: the DeviceRadixSort kernels live in DeviceRadixSort.compute. They require wave
+// intrinsics, and #pragma require is file-scoped — keeping them here would mark every
+// kernel in this file as unsupported on platforms without wave ops (e.g. OpenGL ES).
+
+#include "GaussianSplatting.hlsl"
+#include "UnityCG.cginc"
+// Per-splat color/opacity/tint hook (called from CSCalcViewData). Edit that file to add custom
+// per-splat visual effects without touching the rest of the renderer.
+#include "GaussianSplatColorModifier.hlsl"
+
+float4x4 _MatrixObjectToWorld;
+float4x4 _MatrixWorldToObject;
+float4x4 _MatrixMV;        // model-view for the covariance projection (CSCalcViewData)
+// Separate model-view for the sort's depth calc (CSCalcDistances). It MUST be a distinct uniform
+// from _MatrixMV: both passes ran in one command buffer and the sort writes a depth-flipped matrix,
+// so sharing one uniform let the covariance dispatch read the sort's stale flipped matrix on
+// OpenGL ES/ANGLE (uniform updates between dispatches aren't honored there) — splats came out
+// mis-oriented / "billboarded". Desktop honored the ordering so it only showed on device.
+float4x4 _SortMatrixMV;
+// Camera matrices, passed explicitly: _MatrixVP / _MatrixP built-in globals
+// are not reliably populated for compute dispatches on all backends (notably OpenGL ES,
+// where they can hold another pass's matrices — e.g. the shadow camera's).
+float4x4 _MatrixVP;
+float4x4 _MatrixP;
+float4 _VecScreenParams;
+float4 _VecWorldSpaceCameraPos;
+int _SelectionMode;
+
+RWStructuredBuffer<uint> _SplatSortDistances;
+RWStructuredBuffer<uint> _SplatSortKeys;
+uint _SplatCount;
+// When nonzero, sort keys are bit-inverted so the ascending sort yields farthest-first
+// (back-to-front). Used on OpenGL ES, where the splat shader switches to "over" blending
+// because dst-alpha-dependent blend factors are unreliable there.
+uint _SortKeysInvert;
+// 16-bit sort keys (see GaussianSplatRenderer.s_Sort16BitKeys): quantize camera-space depth
+// into [0..65534] over this renderer's depth range so the radix sort finishes in 2 passes
+// instead of 4 (the whole 32-bit float range never carries useful order - splat depths span
+// only the object's bounds). x = camera-space depth at the near edge of the (conservative)
+// bounds, y = 1/(depth range). Depths outside the range saturate: they can only tie at the
+// extreme ends, where relative order among the clamped splats no longer matters visually.
+float4 _SortDepthParams;
+uint _Sort16BitKeys;
+
+// Screen-size-cull compaction (see CSCalcDistances / GlobalScreenSizeCull). When _CullToBack is
+// set, splats that CSCalcViewData flagged as culled (view.pos.w <= 0) get the max sort key so the
+// radix/bitonic sort parks them past the end of the visible draw order, and the surviving count is
+// accumulated into _VisibleCounter for an indirect draw over just the visible prefix.
+int _CullToBack;
+RWStructuredBuffer<uint> _VisibleCounter; // single element: number of non-culled splats this sort
+RWStructuredBuffer<uint> _DrawArgs;       // 5 uints: indexCountPerInstance, instanceCount, start*3
+uint _DrawIndexCount;                     // indices per splat instance (6 = two triangles)
+uint _DrawMaxInstances;                   // hard cap for the indirect instanceCount (order buffer length)
+// Length of _SplatViewData / the per-splat buffers, i.e. the renderer's FULL splat count. Needed
+// separately from _SplatCount because that one is overwritten per dispatch with the LOD top-K
+// prefix. Passed as a uniform rather than queried with GetDimensions: Unity's non-DXC translator
+// rejects buffer size queries on Metal ("Metal shading language does not support buffer size query
+// from shader. Pass the size to shader as const instead"), and this file has no #pragma use_dxc.
+uint _SplatCountFull;
+// Per-splat view data (clip pos + projected axes + color). Declared here, above CSCalcDistances,
+// so the compaction path can read each splat's cull flag (pos.w) when tallying visibility.
+RWStructuredBuffer<SplatViewData> _SplatViewData;
+// Unified (cross-object) sorting: index of this renderer's first slot in the SHARED view buffer
+// every splat object writes into. 0 in the normal per-object mode, where the buffer belongs to
+// this renderer alone - so the write below is unchanged there. See SplatUnifiedSort.cs.
+uint _ViewBase;
+
+// radix sort etc. friendly, see http://stereopsis.com/radix.html
+uint FloatToSortableUint(float f)
+{
+    uint fu = asuint(f);
+    uint mask = -((int)(fu >> 31)) | 0x80000000;
+    return fu ^ mask;
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSSetIndices (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+
+    _SplatSortKeys[idx] = idx;
+}
+
+groupshared uint gs_visibleCount; // per-group tally of non-culled splats (compaction path only)
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSCalcDistances (uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    // Compaction hook (uniform branch on _CullToBack, so barriers below are safe). Splats that
+    // CSCalcViewData flagged culled (pos.w <= 0) are pushed to the back of the sort so an indirect
+    // draw can skip them; the survivors are counted into _VisibleCounter. CSCalcViewData runs after
+    // this in the frame, so the flags are last frame's - the vertex shader's own w<=0 discard is the
+    // backstop, so a splat crossing the threshold is at worst one frame late. Note: no early-return
+    // here (unlike the plain path) because all lanes must reach the group barriers.
+    if (_CullToBack != 0 && gi == 0)
+        gs_visibleCount = 0;
+    if (_CullToBack != 0)
+        GroupMemoryBarrierWithGroupSync();
+
+    uint idx = id.x;
+    if (idx < _SplatCount)
+    {
+        uint origIdx = _SplatSortKeys[idx];
+        // Defensive clamp, the compute-side twin of the one in RenderGaussianSplats.shader's vert.
+        // _SplatSortKeys is seeded over the WHOLE buffer, which on the bitonic fallback is padded
+        // past the splat count, so its entries are not bounded by splatCount; under LOD the region
+        // past the reseeded prefix also holds a stale permutation. origIdx then indexes _SplatSkinPos
+        // / _SplatPos (via LoadSplatPos) and _SplatViewData below, all sized to the full splat count -
+        // an out-of-range value is an OOB read that Metal page-faults on (D3D11 returns 0). Bound it
+        // by the actual view-buffer length rather than _SplatCount: under LOD _SplatCount is the
+        // smaller top-K prefix, and clamping to that would corrupt the order of legitimately larger
+        // indices. _SplatCountFull is that length, passed in as a uniform (see its declaration).
+        origIdx = min(origIdx, _SplatCountFull - 1u);
+
+        float3 pos = LoadSplatPos(origIdx);
+        pos = mul(_SortMatrixMV, float4(pos.xyz, 1)).xyz; // own uniform: must not alias _MatrixMV (see decl)
+
+        uint key;
+        if (_Sort16BitKeys != 0)
+        {
+            // Quantized 16-bit key: 65534 buckets over the renderer's own depth range (see
+            // _SortDepthParams). 65535 stays reserved as the cull-to-back sentinel below.
+            float t = saturate((pos.z - _SortDepthParams.x) * _SortDepthParams.y);
+            key = (uint)(t * 65534.0 + 0.5);
+            if (_SortKeysInvert != 0)
+                key = 65534u - key;
+        }
+        else
+        {
+            key = FloatToSortableUint(pos.z);
+            if (_SortKeysInvert != 0)
+                key = ~key;
+        }
+
+        if (_CullToBack != 0)
+        {
+            if (_SplatViewData[origIdx].pos.w <= 0)
+                // park culled splats past the visible draw prefix (max representable key)
+                key = _Sort16BitKeys != 0 ? 0xFFFFu : 0xFFFFFFFFu;
+            else
+                InterlockedAdd(gs_visibleCount, 1u);
+        }
+        _SplatSortDistances[idx] = key;
+    }
+
+    if (_CullToBack != 0)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (gi == 0)
+            InterlockedAdd(_VisibleCounter[0], gs_visibleCount);
+    }
+}
+
+float _SplatScale;
+float _SplatOpacityScale;
+// Minimum on-screen footprint radius, in pixels. Splats projecting smaller than this are
+// culled in CSCalcViewData before they ever reach the blend. 0 disables the cull (original
+// behaviour). Guards against far-away crowds piling millions of sub-pixel quads onto a few
+// pixels, which serializes the alpha blend (ROP-bound) and tanks the frame rate.
+float _SplatScreenSizeCull;
+uint _SHOrder;
+uint _SHOnly;
+
+uint _SplatCutoutsCount;
+
+#define SPLAT_CUTOUT_TYPE_ELLIPSOID 0
+#define SPLAT_CUTOUT_TYPE_BOX 1
+
+struct GaussianCutoutShaderData // match GaussianCutout.ShaderData in C#
+{
+    float4x4 mat;
+    uint typeAndFlags;
+};
+StructuredBuffer<GaussianCutoutShaderData> _SplatCutouts;
+
+RWByteAddressBuffer _SplatSelectedBits;
+ByteAddressBuffer _SplatDeletedBits;
+uint _SplatBitsValid;
+
+bool IsSplatCut(float3 pos)
+{
+    bool finalCut = false;
+    for (uint i = 0; i < _SplatCutoutsCount; ++i)
+    {
+        GaussianCutoutShaderData cutData = _SplatCutouts[i];
+        uint type = cutData.typeAndFlags & 0xFF;
+        if (type == 0xFF) // invalid/null cutout, ignore
+            continue;
+        bool invert = (cutData.typeAndFlags & 0xFF00) != 0;
+
+        float3 cutoutPos = mul(cutData.mat, float4(pos, 1)).xyz;
+        if (type == SPLAT_CUTOUT_TYPE_ELLIPSOID)
+        {
+            if (dot(cutoutPos, cutoutPos) <= 1) return invert;
+        }
+        if (type == SPLAT_CUTOUT_TYPE_BOX)
+        {
+            if (all(abs(cutoutPos) <= 1)) return invert;
+        }
+        finalCut = finalCut || !invert; // not |=: GLES compiler rejects bitwise-assign on bool
+    }
+    return finalCut;
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSCalcViewData (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+
+    SplatData splat = LoadSplatData(idx, _SHOrder); // order 0 skips the SH fetch entirely
+    SplatViewData view = (SplatViewData)0;
+    
+    float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos,1)).xyz;
+    float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
+    half opacityScale = _SplatOpacityScale;
+    float splatScale = _SplatScale;
+
+    // deleted?
+    if (_SplatBitsValid)
+    {
+        uint wordIdx = idx / 32;
+        uint bitIdx = idx & 31;
+        uint wordVal = _SplatDeletedBits.Load(wordIdx * 4);
+        if (wordVal & (1 << bitIdx))
+        {
+            centerClipPos.w = 0;
+        }
+    }
+
+    // cutouts
+    if (IsSplatCut(splat.pos))
+    {
+        centerClipPos.w = 0;
+    }
+
+    view.pos = centerClipPos;
+    // Camera-space depth, in the ONE space every splat object shares. Written for every splat
+    // (including culled/behind-camera ones, which still occupy an order slot) into the two unused
+    // padding words of the view struct, so unified sorting costs no extra per-splat memory. Unity's
+    // view matrix looks down -z, so this is negative in front of the camera and ascending order is
+    // far-to-near, which is exactly the back-to-front draw order the "over" blend needs.
+    view.color.z = asuint(mul(_MatrixMV, float4(splat.pos, 1)).z);
+    bool behindCam = centerClipPos.w <= 0;
+    if (!behindCam)
+    {
+        float4 boxRot = splat.rot;
+        float3 boxSize = splat.scale;
+
+        // Covariance directly from rot+scale, no float3x3 ops (see CalcCovariance3DFromRotScale).
+        float3 cov3d0, cov3d1;
+        CalcCovariance3DFromRotScale(boxRot, boxSize, cov3d0, cov3d1);
+        float splatScale2 = splatScale * splatScale;
+        cov3d0 *= splatScale2;
+        cov3d1 *= splatScale2;
+        float3 cov2d = CalcCovariance2D(splat.pos, cov3d0, cov3d1, _MatrixMV, _MatrixP, _VecScreenParams);
+        
+        float2 axis1, axis2;
+        DecomposeCovariance(cov2d, axis1, axis2); // out params can't be float4 swizzles, so use temps
+        // The vertex shader adds these axes RAW in clip space (o.vertex.xy += delta*w), so they
+        // inherit the projection's y orientation. They are authored against the y-flipped
+        // render-into-texture projection of D3D/Metal (P._m11 < 0). OpenGL projections are never
+        // y-flipped (P._m11 > 0), so there the same axes come out vertically MIRRORED: anisotropic
+        // splats render mis-oriented — appearing to rotate with the camera, and rim splats poke
+        // out of the silhouette as fuzzy spikes. Centers are unaffected (full _MatrixVP path).
+        if (_MatrixP._m11 > 0)
+        {
+            axis1.y = -axis1.y;
+            axis2.y = -axis2.y;
+        }
+        view.axis = float4(axis1, axis2);
+        // Cull splats whose axes came out non-finite or absurdly large (degenerate input
+        // data): on GLES such quads rasterize as garbage needles instead of being discarded.
+        float axisLen2 = dot(axis1, axis1) + dot(axis2, axis2);
+        if (!(axisLen2 < 16384.0 * 16384.0)) // also true for NaN
+            view.pos.w = 0;
+
+        // Screen-size cull. The quad extends to ~2*axis pixels from its center (the vertex
+        // shader multiplies the axes by quadPos in [-2,2]; beyond that the exp() Gaussian tail
+        // is below the 1/255 discard). So the footprint radius is ~2*max(|axis1|,|axis2|).
+        // Drop splats below the pixel threshold so distant crowds stop paying full overdraw.
+        if (_SplatScreenSizeCull > 0)
+        {
+            float footprintRadius2 = 4.0 * max(dot(axis1, axis1), dot(axis2, axis2));
+            if (footprintRadius2 < _SplatScreenSizeCull * _SplatScreenSizeCull)
+                view.pos.w = 0;
+        }
+
+        float3 worldViewDir = _VecWorldSpaceCameraPos.xyz - centerWorldPos;
+        float3 objViewDir = mul((float3x3)_MatrixWorldToObject, worldViewDir);
+        objViewDir = normalize(objViewDir);
+
+        half4 col;
+        col.rgb = ShadeSH(splat.sh, objViewDir, _SHOrder, _SHOnly != 0);
+        col.a = min(splat.opacity * opacityScale, 65000);
+
+        // Approximate splat surface normal = its thinnest ellipsoid axis (the smallest-scale
+        // principal axis), in object space — the columns of the rotation matrix are the local
+        // axes. Used by the color hook for view-angle (fresnel) effects.
+        float qx = boxRot.x, qy = boxRot.y, qz = boxRot.z, qw = boxRot.w;
+        float3 axX = float3(1-2*(qy*qy+qz*qz),   2*(qx*qy+qw*qz),   2*(qx*qz-qw*qy));
+        float3 axY = float3(  2*(qx*qy-qw*qz), 1-2*(qx*qx+qz*qz),   2*(qy*qz+qw*qx));
+        float3 axZ = float3(  2*(qx*qz+qw*qy),   2*(qy*qz-qw*qx), 1-2*(qx*qx+qy*qy));
+        float3 objNormal = axX; float minScale = boxSize.x;
+        if (boxSize.y < minScale) { minScale = boxSize.y; objNormal = axY; }
+        if (boxSize.z < minScale) { minScale = boxSize.z; objNormal = axZ; }
+
+        // Per-splat color/opacity/tint hook (see GaussianSplatColorModifier.hlsl). normal and
+        // viewDir are object-space; their dot is the view-facing term for fresnel effects.
+        ModifySplatColor(idx, centerWorldPos, splat.pos, centerClipPos, objNormal, objViewDir, col);
+        // A splat the hook fully erased (occlusion reveal, fresnel at threshold) is
+        // culled like an off-screen one instead of rasterizing an invisible quad.
+        if (col.a <= 0)
+            view.pos.w = 0;
+        view.color.x = (f32tof16(col.r) << 16) | f32tof16(col.g);
+        view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
+    }
+
+    // _ViewBase is 0 unless unified sorting is on, in which case this renderer owns the slice
+    // [_ViewBase, _ViewBase + splatCount) of one buffer shared by every splat object.
+    _SplatViewData[_ViewBase + idx] = view;
+}
+
+// Packs _SplatViewData into _SplatViewDataTex for the vertex-texture-fetch path. Runs over
+// draw slots: slot p reads the splat at sorted index _SplatSortKeys[p], so the texture ends up
+// in draw order and the vertex shader needs no order indirection. 3 RGBA32F texels per splat:
+// [0]=clip pos, [1]=axes, [2]=color unpacked to plain floats (storing the fp16-packed uints via
+// asfloat would risk NaN/Inf flushing in the float render target). Layout matches ViewTexCoord
+// in RenderGaussianSplats.shader. _SplatCount here is the draw instance count (= splat count).
+// UInt rather than SFloat, and 2 texels rather than 3.
+//
+// The vertex stage re-reads every texel once per quad corner (4 vertices per splat), so this
+// texture is read 4x per splat per frame. At 48 bytes/splat that was 192 B/splat/frame - ~19MB
+// per frame at 100k splats, all of it in the vertex stage, which on a Mali tiler lands entirely
+// in the front-loaded binning pass. 32 bytes/splat makes that 128 B/splat/frame, a 33% cut.
+//
+// A UInt format is what makes the packing possible at all: the old comment here rejected packing
+// because "asfloat would risk NaN/Inf flushing in the float render target", which is true of an
+// SFloat target and not of a UInt one, where bit patterns pass through untouched.
+//
+// Layout, 2 x uint4:
+//   [0] = asuint(clip pos.xyzw)            full fp32, unchanged - depth precision matters here
+//   [1] = .x axis.xy as 2 halves           axes are in PIXELS; fp16 gives ~0.01px at typical
+//         .y axis.zw as 2 halves           splat sizes and ~0.5px at 500px, both invisible
+//         .zw view.color.xy verbatim       already fp16-packed upstream, so no repack at all
+RWTexture2D<uint4> _SplatViewDataTex;
+uint _SplatViewTexWidth;
+uint2 BuildViewTexCoord(uint linearTexel)
+{
+    return uint2(linearTexel % _SplatViewTexWidth, linearTexel / _SplatViewTexWidth);
+}
+
+uint PackHalf2(float a, float b)
+{
+    return (f32tof16(a) & 0xFFFFu) | (f32tof16(b) << 16);
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSBuildViewTex (uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= _SplatCount)
+        return;
+
+    // Same clamp as CSCalcDistances: _SplatSortKeys entries are not bounded by the splat count
+    // (padded bitonic buffer / stale LOD tail), and _SplatViewData is. See the note there.
+    uint idx = min(_SplatSortKeys[p], _SplatCountFull - 1u);
+    SplatViewData view = _SplatViewData[idx];
+
+    // view.color is already two fp16 pairs, so it is copied through rather than unpacked here and
+    // re-packed in the vertex shader - the old float path had to do both.
+    uint baseTexel = p * 2u;
+    _SplatViewDataTex[BuildViewTexCoord(baseTexel + 0u)] = asuint(view.pos);
+    _SplatViewDataTex[BuildViewTexCoord(baseTexel + 1u)] = uint4(
+        PackHalf2(view.axis.x, view.axis.y),
+        PackHalf2(view.axis.z, view.axis.w),
+        view.color.x,
+        view.color.y);
+}
+
+// Screen-size-cull compaction: zero the visible tally before CSCalcDistances accumulates into it.
+[numthreads(1,1,1)]
+void CSClearVisibleCounter (uint3 id : SV_DispatchThreadID)
+{
+    _VisibleCounter[0] = 0;
+}
+
+// Screen-size-cull compaction: publish the tally into the indirect-draw args (instanceCount slot)
+// after the sort. Layout matches GraphicsBuffer.IndirectDrawIndexedArgs.
+[numthreads(1,1,1)]
+void CSWriteDrawArgs (uint3 id : SV_DispatchThreadID)
+{
+    _DrawArgs[0] = _DrawIndexCount;    // indexCountPerInstance (6)
+    // Clamp the instance count to what the buffers can actually feed. The vertex shader indexes
+    // _OrderBuffer by SV_InstanceID, so an instanceCount larger than the order buffer is a
+    // straight out-of-bounds read on the GPU with nothing on the CPU side able to catch it
+    // (this value is produced on-device by CSCalcDistances' tally). Metal page-faults on that;
+    // D3D11 hides it. _DrawMaxInstances is set from the order buffer's length before dispatch.
+    _DrawArgs[1] = min(_VisibleCounter[0], _DrawMaxInstances); // instanceCount = visible splats
+    _DrawArgs[2] = 0;                  // startIndex
+    _DrawArgs[3] = 0;                  // baseVertexIndex
+    _DrawArgs[4] = 0;                  // startInstance
+}
+
+RWByteAddressBuffer _DstBuffer;
+ByteAddressBuffer _SrcBuffer;
+uint _BufferSize;
+
+// LOD on the bitonic-sort path: fill _SplatSortDistances[_SplatCount .. _BufferSize) with the
+// max-key sentinel so the top-K prefix sort parks those slots at the back. _SplatCount is the
+// fill START (the LOD prefix end, K); _BufferSize is the fill END (the power-of-two region the
+// bitonic sort will run over). Dispatched over (_BufferSize - _SplatCount) threads. The kernel
+// INDEX is set by the #pragma order near the top of the file (right after CSWriteDrawArgs);
+// the function merely lives here so it can see _BufferSize.
+[numthreads(GROUP_SIZE,1,1)]
+void CSFillSortDistances (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x + _SplatCount;
+    if (idx >= _BufferSize)
+        return;
+    _SplatSortDistances[idx] = 0xFFFFFFFFu;
+}
+
+uint2 GetSplatIndicesFromWord(uint idx)
+{
+    uint idxStart = idx * 32;
+    uint idxEnd = min(idxStart + 32, _SplatCount);
+    return uint2(idxStart, idxEnd);
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSUpdateEditData (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _BufferSize)
+        return;
+
+    uint valSel = _SplatSelectedBits.Load(idx * 4);
+    uint valDel = _SplatDeletedBits.Load(idx * 4);
+    valSel &= ~valDel; // don't count deleted splats as selected
+    uint2 splatIndices = GetSplatIndicesFromWord(idx);
+
+    // update selection bounds
+    float3 bmin = 1.0e38;
+    float3 bmax = -1.0e38;
+    uint mask = 1;
+    uint valCut = 0;
+    for (uint sidx = splatIndices.x; sidx < splatIndices.y; ++sidx, mask <<= 1)
+    {
+        float3 spos = LoadSplatPos(sidx);
+        // don't count cut splats as selected
+        if (IsSplatCut(spos))
+        {
+            valSel &= ~mask;
+            valCut |= mask;
+        }
+        if (valSel & mask)
+        {
+            bmin = min(bmin, spos);
+            bmax = max(bmax, spos);
+        }
+    }
+    valCut &= ~valDel; // don't count deleted splats as cut
+
+    if (valSel != 0)
+    {
+        _DstBuffer.InterlockedMin(12, FloatToSortableUint(bmin.x));
+        _DstBuffer.InterlockedMin(16, FloatToSortableUint(bmin.y));
+        _DstBuffer.InterlockedMin(20, FloatToSortableUint(bmin.z));
+        _DstBuffer.InterlockedMax(24, FloatToSortableUint(bmax.x));
+        _DstBuffer.InterlockedMax(28, FloatToSortableUint(bmax.y));
+        _DstBuffer.InterlockedMax(32, FloatToSortableUint(bmax.z));
+    }
+    uint sumSel = countbits(valSel);
+    uint sumDel = countbits(valDel);
+    uint sumCut = countbits(valCut);
+    _DstBuffer.InterlockedAdd(0, sumSel);
+    _DstBuffer.InterlockedAdd(4, sumDel);
+    _DstBuffer.InterlockedAdd(8, sumCut);
+}
+
+[numthreads(1,1,1)]
+void CSInitEditData (uint3 id : SV_DispatchThreadID)
+{
+    _DstBuffer.Store3(0, uint3(0,0,0)); // selected, deleted, cut counts
+    uint initMin = FloatToSortableUint(1.0e38);
+    uint initMax = FloatToSortableUint(-1.0e38);
+    _DstBuffer.Store3(12, uint3(initMin, initMin, initMin));
+    _DstBuffer.Store3(24, uint3(initMax, initMax, initMax));
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSClearBuffer (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _BufferSize)
+        return;
+    _DstBuffer.Store(idx * 4, 0);
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSInvertSelection (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _BufferSize)
+        return;
+    uint v = _DstBuffer.Load(idx * 4);
+    v = ~v;
+
+    // do not select splats that are cut
+    uint2 splatIndices = GetSplatIndicesFromWord(idx);
+    uint mask = 1;
+    for (uint sidx = splatIndices.x; sidx < splatIndices.y; ++sidx, mask <<= 1)
+    {
+        float3 spos = LoadSplatPos(sidx);
+        if (IsSplatCut(spos))
+            v &= ~mask;
+    }
+
+    _DstBuffer.Store(idx * 4, v);
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSSelectAll (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _BufferSize)
+        return;
+    uint v = ~0;
+
+    // do not select splats that are cut
+    uint2 splatIndices = GetSplatIndicesFromWord(idx);
+    uint mask = 1;
+    for (uint sidx = splatIndices.x; sidx < splatIndices.y; ++sidx, mask <<= 1)
+    {
+        float3 spos = LoadSplatPos(sidx);
+        if (IsSplatCut(spos))
+            v &= ~mask;
+    }
+
+    _DstBuffer.Store(idx * 4, v);
+}
+
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSOrBuffers (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _BufferSize)
+        return;
+    uint a = _SrcBuffer.Load(idx * 4);
+    uint b = _DstBuffer.Load(idx * 4);
+    _DstBuffer.Store(idx * 4, a | b);
+}
+
+float4 _SelectionRect;
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSSelectionUpdate (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+
+    float3 pos = LoadSplatPos(idx);
+    if (IsSplatCut(pos))
+        return;
+
+    float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(pos,1)).xyz;
+    float4 centerClipPos = mul(_MatrixVP, float4(centerWorldPos, 1));
+    centerClipPos.y *= -1;
+    bool behindCam = centerClipPos.w <= 0;
+    if (behindCam)
+        return;
+
+    float2 pixelPos = (centerClipPos.xy / centerClipPos.w * float2(0.5, -0.5) + 0.5) * _VecScreenParams.xy;
+    if (pixelPos.x < _SelectionRect.x || pixelPos.x > _SelectionRect.z ||
+        pixelPos.y < _SelectionRect.y || pixelPos.y > _SelectionRect.w)
+    {
+        return;
+    }
+    uint wordIdx = idx / 32;
+    uint bitIdx = idx & 31;
+    if (_SelectionMode)
+        _SplatSelectedBits.InterlockedOr(wordIdx * 4, 1u << bitIdx); // +
+    else
+        _SplatSelectedBits.InterlockedAnd(wordIdx * 4, ~(1u << bitIdx)); // -
+}
+
+float3 _SelectionDelta;
+
+bool IsSplatSelected(uint idx)
+{
+    uint wordIdx = idx / 32;
+    uint bitIdx = idx & 31;
+    uint selVal = _SplatSelectedBits.Load(wordIdx * 4);
+    return (selVal & (1 << bitIdx)) != 0;
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSTranslateSelection (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+    if (!IsSplatSelected(idx))
+        return;
+
+    uint fmt = _SplatFormat & 0xFF;
+    if (_SplatChunkCount == 0 && fmt == VECTOR_FMT_32F)
+    {
+        uint stride = 12;
+        float3 pos = asfloat(_SplatPos.Load3(idx * stride));
+        pos += _SelectionDelta;
+        _SplatPos.Store3(idx * stride, asuint(pos));
+    }
+}
+
+float3 _SelectionCenter;
+float4 _SelectionDeltaRot;
+ByteAddressBuffer _SplatPosMouseDown;
+ByteAddressBuffer _SplatOtherMouseDown;
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSRotateSelection (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+    if (!IsSplatSelected(idx))
+        return;
+
+    uint posFmt = _SplatFormat & 0xFF;
+    if (_SplatChunkCount == 0 && posFmt == VECTOR_FMT_32F)
+    {
+        uint posStride = 12;
+        float3 pos = asfloat(_SplatPosMouseDown.Load3(idx * posStride));
+        pos -= _SelectionCenter;
+        pos = mul(_MatrixObjectToWorld, float4(pos,1)).xyz;
+        pos = QuatRotateVector(pos, _SelectionDeltaRot);
+        pos = mul(_MatrixWorldToObject, float4(pos,1)).xyz;
+        pos += _SelectionCenter;
+        _SplatPos.Store3(idx * posStride, asuint(pos));
+    }
+
+    uint scaleFmt = (_SplatFormat >> 8) & 0xFF;
+    uint shFormat = (_SplatFormat >> 16) & 0xFF;
+    if (_SplatChunkCount == 0 && scaleFmt == VECTOR_FMT_32F && shFormat == VECTOR_FMT_32F)
+    {
+        uint otherStride = 4 + 12;
+        uint rotVal = _SplatOtherMouseDown.Load(idx * otherStride);
+        float4 rot = DecodeRotation(DecodePacked_10_10_10_2(rotVal));
+
+        //@TODO: correct rotation
+        rot = QuatMul(rot, _SelectionDeltaRot);
+
+        rotVal = EncodeQuatToNorm10(PackSmallest3Rotation(rot));
+        _SplatOther.Store(idx * otherStride, rotVal);
+    }
+
+    //@TODO: rotate SHs
+}
+
+//@TODO: maybe scale the splat scale itself too?
+[numthreads(GROUP_SIZE,1,1)]
+void CSScaleSelection (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+    if (!IsSplatSelected(idx))
+        return;
+
+    uint fmt = _SplatFormat & 0xFF;
+    if (_SplatChunkCount == 0 && fmt == VECTOR_FMT_32F)
+    {
+        uint stride = 12;
+        float3 pos = asfloat(_SplatPosMouseDown.Load3(idx * stride));
+        pos -= _SelectionCenter;
+        pos = mul(_MatrixObjectToWorld, float4(pos,1)).xyz;
+        pos *= _SelectionDelta;
+        pos = mul(_MatrixWorldToObject, float4(pos,1)).xyz;
+        pos += _SelectionCenter;
+        _SplatPos.Store3(idx * stride, asuint(pos));
+    }
+}
+
+struct ExportSplatData
+{
+    float3 pos;
+    float3 nor;
+    float3 dc0;
+    float4 shR14; float4 shR58; float4 shR9C; float3 shRDF;
+    float4 shG14; float4 shG58; float4 shG9C; float3 shGDF;
+    float4 shB14; float4 shB58; float4 shB9C; float3 shBDF;
+    float opacity;
+    float3 scale;
+    float4 rot;
+};
+RWStructuredBuffer<ExportSplatData> _ExportBuffer;
+
+float3 ColorToSH0(float3 col)
+{
+    return (col - 0.5) / 0.2820948;
+}
+float InvSigmoid(float v)
+{
+    return log(v / max(1 - v, 1.0e-6));
+}
+
+// SH rotation
+#include "SphericalHarmonics.hlsl"
+
+void RotateSH(inout SplatSHData sh, float3x3 rot)
+{
+    float3 shin[16];
+    float3 shout[16];
+    shin[0] = sh.col;
+    shin[1] = sh.sh1;
+    shin[2] = sh.sh2;
+    shin[3] = sh.sh3;
+    shin[4] = sh.sh4;
+    shin[5] = sh.sh5;
+    shin[6] = sh.sh6;
+    shin[7] = sh.sh7;
+    shin[8] = sh.sh8;
+    shin[9] = sh.sh9;
+    shin[10] = sh.sh10;
+    shin[11] = sh.sh11;
+    shin[12] = sh.sh12;
+    shin[13] = sh.sh13;
+    shin[14] = sh.sh14;
+    shin[15] = sh.sh15;
+    RotateSH(rot, 4, shin, shout);
+    sh.col = shout[0];
+    sh.sh1 = shout[1];
+    sh.sh2 = shout[2];
+    sh.sh3 = shout[3];
+    sh.sh4 = shout[4];
+    sh.sh5 = shout[5];
+    sh.sh6 = shout[6];
+    sh.sh7 = shout[7];
+    sh.sh8 = shout[8];
+    sh.sh9 = shout[9];
+    sh.sh10 = shout[10];
+    sh.sh11 = shout[11];
+    sh.sh12 = shout[12];
+    sh.sh13 = shout[13];
+    sh.sh14 = shout[14];
+    sh.sh15 = shout[15];
+}
+
+float3x3 CalcSHRotMatrix(float4x4 objToWorld)
+{
+    float3x3 m = (float3x3)objToWorld;
+    float sx = length(float3(m[0][0], m[0][1], m[0][2]));
+    float sy = length(float3(m[1][0], m[1][1], m[1][2]));
+    float sz = length(float3(m[2][0], m[2][1], m[2][2]));
+
+    float invSX = 1.0 / sx;
+    float invSY = 1.0 / sy;
+    float invSZ = 1.0 / sz;
+
+    m[0][0] *= invSX;
+    m[0][1] *= invSX;
+    m[0][2] *= invSX;
+    m[1][0] *= invSY;
+    m[1][1] *= invSY;
+    m[1][2] *= invSY;
+    m[2][0] *= invSZ;
+    m[2][1] *= invSZ;
+    m[2][2] *= invSZ;
+    return m;
+}
+
+
+float4 _ExportTransformRotation;
+float3 _ExportTransformScale;
+uint _ExportTransformFlags;
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSExportData (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _SplatCount)
+        return;
+    SplatData src = LoadSplatData(idx, 3); // export needs the full SH coefficients
+
+    bool isCut = IsSplatCut(src.pos);
+
+    // transform splat by matrix, if needed
+    if (_ExportTransformFlags != 0)
+    {
+        src.pos = mul(_MatrixObjectToWorld, float4(src.pos,1)).xyz;
+
+        // note: this only handles axis flips from scale, not any arbitrary scaling
+        if (_ExportTransformScale.x < 0)
+            src.rot.yz = -src.rot.yz;
+        if (_ExportTransformScale.y < 0)
+            src.rot.xz = -src.rot.xz;
+        if (_ExportTransformScale.z < 0)
+            src.rot.xy = -src.rot.xy;
+        src.rot = QuatMul(_ExportTransformRotation, src.rot);
+        src.scale *= abs(_ExportTransformScale);
+
+        float3x3 shRot = CalcSHRotMatrix(_MatrixObjectToWorld);
+        RotateSH(src.sh, shRot);
+    }
+
+    ExportSplatData dst;
+    dst.pos = src.pos;
+    dst.nor = 0;
+    dst.dc0 = ColorToSH0(src.sh.col);
+    
+    dst.shR14 = float4(src.sh.sh1.r, src.sh.sh2.r, src.sh.sh3.r, src.sh.sh4.r);
+    dst.shR58 = float4(src.sh.sh5.r, src.sh.sh6.r, src.sh.sh7.r, src.sh.sh8.r);
+    dst.shR9C = float4(src.sh.sh9.r, src.sh.sh10.r, src.sh.sh11.r, src.sh.sh12.r);
+    dst.shRDF = float3(src.sh.sh13.r, src.sh.sh14.r, src.sh.sh15.r);
+    
+    dst.shG14 = float4(src.sh.sh1.g, src.sh.sh2.g, src.sh.sh3.g, src.sh.sh4.g);
+    dst.shG58 = float4(src.sh.sh5.g, src.sh.sh6.g, src.sh.sh7.g, src.sh.sh8.g);
+    dst.shG9C = float4(src.sh.sh9.g, src.sh.sh10.g, src.sh.sh11.g, src.sh.sh12.g);
+    dst.shGDF = float3(src.sh.sh13.g, src.sh.sh14.g, src.sh.sh15.g);
+    
+    dst.shB14 = float4(src.sh.sh1.b, src.sh.sh2.b, src.sh.sh3.b, src.sh.sh4.b);
+    dst.shB58 = float4(src.sh.sh5.b, src.sh.sh6.b, src.sh.sh7.b, src.sh.sh8.b);
+    dst.shB9C = float4(src.sh.sh9.b, src.sh.sh10.b, src.sh.sh11.b, src.sh.sh12.b);
+    dst.shBDF = float3(src.sh.sh13.b, src.sh.sh14.b, src.sh.sh15.b);
+    
+    dst.opacity = InvSigmoid(src.opacity);
+    dst.scale = log(src.scale);
+    dst.rot = src.rot.wxyz;
+
+    if (isCut)
+        dst.nor = 1; // mark as skipped for export
+    
+    _ExportBuffer[idx] = dst;
+}
+
+RWByteAddressBuffer _CopyDstPos;
+RWByteAddressBuffer _CopyDstOther;
+RWByteAddressBuffer _CopyDstSH;
+RWByteAddressBuffer _CopyDstEditDeleted;
+RWTexture2D<float4> _CopyDstColor;
+uint _CopyDstSize, _CopySrcStartIndex, _CopyDstStartIndex, _CopyCount;
+
+float4x4 _CopyTransformMatrix;
+float4 _CopyTransformRotation;
+float3 _CopyTransformScale;
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSCopySplats (uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _CopyCount)
+        return;
+    uint srcIdx = _CopySrcStartIndex + idx;
+    uint dstIdx = _CopyDstStartIndex + idx;
+    if (srcIdx >= _SplatCount || dstIdx >= _CopyDstSize)
+        return;
+
+    SplatData src = LoadSplatData(idx, 3); // copy needs the full SH coefficients
+
+    // transform the splat
+    src.pos = mul(_CopyTransformMatrix, float4(src.pos,1)).xyz;
+    // note: this only handles axis flips from scale, not any arbitrary scaling
+    if (_CopyTransformScale.x < 0)
+        src.rot.yz = -src.rot.yz;
+    if (_CopyTransformScale.y < 0)
+        src.rot.xz = -src.rot.xz;
+    if (_CopyTransformScale.z < 0)
+        src.rot.xy = -src.rot.xy;
+    src.rot = QuatMul(_CopyTransformRotation, src.rot);
+    src.scale *= abs(_CopyTransformScale);
+
+    float3x3 shRot = CalcSHRotMatrix(_CopyTransformMatrix);
+    RotateSH(src.sh, shRot);
+
+    // output data into destination:
+    // pos
+    uint posStride = 12;
+    _CopyDstPos.Store3(dstIdx * posStride, asuint(src.pos));
+    // rot + scale
+    uint otherStride = 4 + 12;
+    uint rotVal = EncodeQuatToNorm10(PackSmallest3Rotation(src.rot));
+    _CopyDstOther.Store4(dstIdx * otherStride, uint4(
+        rotVal,
+        asuint(src.scale.x),
+        asuint(src.scale.y),
+        asuint(src.scale.z)));
+    // color
+    uint3 pixelIndex = SplatIndexToPixelIndex(dstIdx);
+    _CopyDstColor[pixelIndex.xy] = float4(src.sh.col, src.opacity);
+
+    // SH
+    uint shStride = 192; // 15*3 fp32, rounded up to multiple of 16
+    uint shOffset = dstIdx * shStride;
+    _CopyDstSH.Store3(shOffset + 12 * 0, asuint(src.sh.sh1));
+    _CopyDstSH.Store3(shOffset + 12 * 1, asuint(src.sh.sh2));
+    _CopyDstSH.Store3(shOffset + 12 * 2, asuint(src.sh.sh3));
+    _CopyDstSH.Store3(shOffset + 12 * 3, asuint(src.sh.sh4));
+    _CopyDstSH.Store3(shOffset + 12 * 4, asuint(src.sh.sh5));
+    _CopyDstSH.Store3(shOffset + 12 * 5, asuint(src.sh.sh6));
+    _CopyDstSH.Store3(shOffset + 12 * 6, asuint(src.sh.sh7));
+    _CopyDstSH.Store3(shOffset + 12 * 7, asuint(src.sh.sh8));
+    _CopyDstSH.Store3(shOffset + 12 * 8, asuint(src.sh.sh9));
+    _CopyDstSH.Store3(shOffset + 12 * 9, asuint(src.sh.sh10));
+    _CopyDstSH.Store3(shOffset + 12 * 10, asuint(src.sh.sh11));
+    _CopyDstSH.Store3(shOffset + 12 * 11, asuint(src.sh.sh12));
+    _CopyDstSH.Store3(shOffset + 12 * 12, asuint(src.sh.sh13));
+    _CopyDstSH.Store3(shOffset + 12 * 13, asuint(src.sh.sh14));
+    _CopyDstSH.Store3(shOffset + 12 * 14, asuint(src.sh.sh15));
+
+    // deleted bits
+    uint srcWordIdx = srcIdx / 32;
+    uint srcBitIdx = srcIdx & 31;
+    if (_SplatDeletedBits.Load(srcWordIdx * 4) & (1u << srcBitIdx))
+    {
+        uint dstWordIdx = dstIdx / 32;
+        uint dstBitIdx = dstIdx & 31;
+        _CopyDstEditDeleted.InterlockedOr(dstWordIdx * 4, 1u << dstBitIdx);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Bitonic merge sort fallback (no wave intrinsics; runs on OpenGL ES 3.1+).
+// Sorts (_SplatSortDistances, _SplatSortKeys) pairs ascending, in place, over a
+// power-of-two element count. The unused tail is padded with 0xFFFFFFFF keys so
+// real splats sort to the front. Driven by GpuBitonicSort.cs.
+
+#define BITONIC_GROUP 128                       // threads per group (<=128: GLES 3.1 workgroup floor, fits Mali-G72)
+#define BITONIC_ELEMS (BITONIC_GROUP * 2)       // elements per group (2 per thread)
+
+uint _BitonicCount;     // padded (power of two) element count
+uint _BitonicSize;      // current bitonic merge size
+uint _BitonicStride;    // current compare-exchange stride (global passes only)
+
+groupshared uint gs_BitonicKeys[BITONIC_ELEMS];
+groupshared uint gs_BitonicVals[BITONIC_ELEMS];
+
+void BitonicLocalCompareExchange(uint a, uint b, bool ascend)
+{
+    uint ka = gs_BitonicKeys[a];
+    uint kb = gs_BitonicKeys[b];
+    if (ascend ? (ka > kb) : (ka < kb))
+    {
+        gs_BitonicKeys[a] = kb;
+        gs_BitonicKeys[b] = ka;
+        uint va = gs_BitonicVals[a];
+        gs_BitonicVals[a] = gs_BitonicVals[b];
+        gs_BitonicVals[b] = va;
+    }
+}
+
+void BitonicLoadShared(uint groupBase, uint t)
+{
+    gs_BitonicKeys[t] = _SplatSortDistances[groupBase + t];
+    gs_BitonicKeys[t + BITONIC_GROUP] = _SplatSortDistances[groupBase + t + BITONIC_GROUP];
+    gs_BitonicVals[t] = _SplatSortKeys[groupBase + t];
+    gs_BitonicVals[t + BITONIC_GROUP] = _SplatSortKeys[groupBase + t + BITONIC_GROUP];
+}
+
+void BitonicStoreShared(uint groupBase, uint t)
+{
+    _SplatSortDistances[groupBase + t] = gs_BitonicKeys[t];
+    _SplatSortDistances[groupBase + t + BITONIC_GROUP] = gs_BitonicKeys[t + BITONIC_GROUP];
+    _SplatSortKeys[groupBase + t] = gs_BitonicVals[t];
+    _SplatSortKeys[groupBase + t + BITONIC_GROUP] = gs_BitonicVals[t + BITONIC_GROUP];
+}
+
+// Initial pass: full bitonic network for sizes 2..BITONIC_ELEMS, within shared memory.
+// Leaves each BITONIC_ELEMS block sorted (direction alternating by the global size bit).
+[numthreads(BITONIC_GROUP,1,1)]
+void CSBitonicSortLocal (uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    uint groupBase = gid.x * BITONIC_ELEMS;
+    BitonicLoadShared(groupBase, gtid.x);
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint size = 2; size <= BITONIC_ELEMS; size <<= 1)
+    {
+        for (uint stride = size >> 1; stride > 0; stride >>= 1)
+        {
+            uint li = (gtid.x / stride) * (stride * 2) + (gtid.x % stride);
+            bool ascend = (((groupBase + li) & size) == 0);
+            BitonicLocalCompareExchange(li, li + stride, ascend);
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+
+    BitonicStoreShared(groupBase, gtid.x);
+}
+
+// One global compare-exchange pass for _BitonicStride >= BITONIC_ELEMS/2.
+// Each pair is touched by exactly one thread, so no synchronization is needed.
+[numthreads(BITONIC_GROUP,1,1)]
+void CSBitonicMergeGlobal (uint3 id : SV_DispatchThreadID)
+{
+    uint t = id.x;
+    if (t >= _BitonicCount / 2)
+        return;
+    uint stride = _BitonicStride;
+    uint lo = (t / stride) * (stride * 2) + (t % stride);
+    uint hi = lo + stride;
+    bool ascend = ((lo & _BitonicSize) == 0);
+    uint ka = _SplatSortDistances[lo];
+    uint kb = _SplatSortDistances[hi];
+    if (ascend ? (ka > kb) : (ka < kb))
+    {
+        _SplatSortDistances[lo] = kb;
+        _SplatSortDistances[hi] = ka;
+        uint va = _SplatSortKeys[lo];
+        _SplatSortKeys[lo] = _SplatSortKeys[hi];
+        _SplatSortKeys[hi] = va;
+    }
+}
+
+// Remaining strides (BITONIC_ELEMS/2 .. 1) of the current merge size, within shared memory.
+[numthreads(BITONIC_GROUP,1,1)]
+void CSBitonicMergeLocal (uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    uint groupBase = gid.x * BITONIC_ELEMS;
+    BitonicLoadShared(groupBase, gtid.x);
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = BITONIC_ELEMS >> 1; stride > 0; stride >>= 1)
+    {
+        uint li = (gtid.x / stride) * (stride * 2) + (gtid.x % stride);
+        bool ascend = (((groupBase + li) & _BitonicSize) == 0);
+        BitonicLocalCompareExchange(li, li + stride, ascend);
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    BitonicStoreShared(groupBase, gtid.x);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Counting sort over the 16-bit depth keys.
+//
+// WHY: the bitonic fallback issues one dispatch per compare-exchange stage - k(k+1)/2 of them for
+// 2^k elements, so 153 for a 67k-splat character padded to 131072, times every character, every
+// frame. That cost is dominated by dispatch and barrier overhead rather than GPU throughput, which
+// is why it does not shrink when you move to a faster GPU and why cutting splat count barely helps
+// (the pass count is O(log^2 n)). This replaces the whole network with 7 dispatches of O(n) work.
+//
+// The keys are already quantized to 16 bits by CSCalcDistances (65534 buckets plus 0xFFFF reserved
+// as the cull-to-back sentinel), so a 65536-bin counting sort is EXACT on the same key space - not
+// an approximation. Ordering among splats with equal keys differs from the bitonic result, but both
+// are arbitrary there and the keys are sub-millimetre apart.
+//
+// DELIBERATELY NO groupshared AND NO BARRIERS anywhere below. The shared-memory bitonic kernels
+// were abandoned because they mis-execute through ANGLE on Android GLES drivers (see
+// GpuBitonicSort.Dispatch), and ANGLE is exactly what the target devices run. Each thread instead
+// walks a contiguous run of bins serially. Slightly off-optimal, and immune to that class of bug.
+//
+// Uniform names are prefixed _Count* rather than reusing _SplatCount etc: uniform updates between
+// dispatches in one command buffer are not reliably honoured on ANGLE (the reason _SortMatrixMV
+// exists separately from _MatrixMV), so these must not alias anything another pass writes.
+// ---------------------------------------------------------------------------------------------
+
+#define COUNT_BINS 65536
+#define COUNT_BLOCKS 256
+#define COUNT_BINS_PER_BLOCK (COUNT_BINS / COUNT_BLOCKS)   // 256
+
+RWStructuredBuffer<uint> _CountHist;      // COUNT_BINS entries: counts, then start offsets
+RWStructuredBuffer<uint> _CountBlockSum;  // COUNT_BLOCKS entries: per-block totals, then bases
+RWStructuredBuffer<uint> _CountOut;       // scatter destination for the payload
+uint _CountNum;                           // splats to sort this dispatch (LOD prefix or full count)
+uint _CountOutSize;                       // length of _CountOut, for the scatter clamp
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSCountClear (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i < COUNT_BINS)
+        _CountHist[i] = 0;
+    if (i < COUNT_BLOCKS)
+        _CountBlockSum[i] = 0;
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSCountHistogram (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CountNum)
+        return;
+    // Clamp defensively: a key can only exceed the bin count if the distance pass wrote something
+    // impossible, and an out-of-range atomic here is precisely the shape of GPU write that faults
+    // unpredictably rather than failing loudly.
+    uint key = min(_SplatSortDistances[i], (uint)COUNT_BINS - 1u);
+    InterlockedAdd(_CountHist[key], 1u);
+}
+
+// One thread per block, each totalling its own contiguous run of bins.
+[numthreads(GROUP_SIZE,1,1)]
+void CSCountBlockSums (uint3 id : SV_DispatchThreadID)
+{
+    uint b = id.x;
+    if (b >= COUNT_BLOCKS)
+        return;
+    uint base = b * COUNT_BINS_PER_BLOCK;
+    uint total = 0;
+    for (uint k = 0; k < COUNT_BINS_PER_BLOCK; ++k)
+        total += _CountHist[base + k];
+    _CountBlockSum[b] = total;
+}
+
+// Single thread walking 256 entries: an exclusive scan of the block totals. Trivial work, and one
+// dispatch is cheaper than any parallel scan that would need barriers to be correct.
+[numthreads(1,1,1)]
+void CSCountScanBlockSums (uint3 id : SV_DispatchThreadID)
+{
+    uint running = 0;
+    for (uint b = 0; b < COUNT_BLOCKS; ++b)
+    {
+        uint c = _CountBlockSum[b];
+        _CountBlockSum[b] = running;   // exclusive prefix: where this block's range starts
+        running += c;
+    }
+}
+
+// One thread per block: rewrite its bins from counts into absolute start offsets.
+[numthreads(GROUP_SIZE,1,1)]
+void CSCountBinOffsets (uint3 id : SV_DispatchThreadID)
+{
+    uint b = id.x;
+    if (b >= COUNT_BLOCKS)
+        return;
+    uint base = b * COUNT_BINS_PER_BLOCK;
+    uint running = _CountBlockSum[b];
+    for (uint k = 0; k < COUNT_BINS_PER_BLOCK; ++k)
+    {
+        uint c = _CountHist[base + k];
+        _CountHist[base + k] = running;
+        running += c;
+    }
+}
+
+// Bump each bin's cursor to claim a slot, and drop the payload there. The bins now hold running
+// write positions rather than counts, which is why the histogram cannot be reused without a
+// re-clear.
+[numthreads(GROUP_SIZE,1,1)]
+void CSCountScatter (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CountNum)
+        return;
+    uint key = min(_SplatSortDistances[i], (uint)COUNT_BINS - 1u);
+    uint slot;
+    InterlockedAdd(_CountHist[key], 1u, slot);
+    // The histogram is exact, so slot < _CountNum always holds. Clamped anyway: this is the one
+    // write in the whole sort whose address is computed from buffer contents, and the project has
+    // an open GPU page fault.
+    _CountOut[min(slot, _CountOutSize - 1u)] = _SplatSortKeys[i];
+}
+
+// Sorted payload back into the order buffer the renderer binds. A ping-pong would avoid this pass,
+// but the order buffer is bound on materials, property blocks and the outline mask, so one extra
+// linear copy of n uints is far cheaper than keeping all of those in sync.
+[numthreads(GROUP_SIZE,1,1)]
+void CSCountCopyBack (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _CountNum)
+        return;
+    _SplatSortKeys[i] = _CountOut[i];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Unified (cross-object) sorting - see SplatUnifiedSort.cs. Optional, off by default.
+//
+// Normally each splat object sorts only its own splats and the objects are drawn one at a time, so
+// a character standing inside an environment capture is drawn entirely in front of, or entirely
+// behind, that environment. This kernel builds the (key, payload) arrays for ONE order spanning
+// every visible splat object, which is then sorted and drawn as a single draw.
+//
+// Input is a table of regions: one per visible object, mapping a contiguous run of output slots
+// onto that object's slice of the shared view buffer. A thread finds its region by binary search
+// (log2 of the object count, a handful of steps, and the top levels are the same few cache lines
+// for every thread in a wave), so the cost is independent of how many objects there are - which
+// matters, because a crowd can have hundreds.
+//
+// Uniform names are prefixed _Uni for the same reason the counting sort's are prefixed _Count:
+// uniform updates between dispatches in one command buffer are not reliably honoured on ANGLE, so
+// these must not alias anything another pass writes (notably _SplatCount / _SplatCountFull, which
+// every per-object dispatch rewrites).
+// ---------------------------------------------------------------------------------------------
+
+struct UnifiedRegion   // must match SplatUnifiedSort.Region in C#
+{
+    uint outOffset;    // first output slot this object occupies
+    uint viewBase;     // its first slot in the shared view buffer
+};
+StructuredBuffer<UnifiedRegion> _UniRegions;
+uint _UniRegionCount;  // number of regions (>= 1 whenever this is dispatched)
+uint _UniCount;        // total output slots = sum of the regions' lengths
+uint _UniViewCount;    // length of the shared view buffer, for the index clamp
+uint _UniKeyBits;      // 16 = quantized depth key (counting sort), 32 = exact (radix sort)
+// x = 1/farthest distance, y = 1/(1/nearest - 1/farthest), z = smallest distance to divide by.
+// The quantization is on INVERSE distance, not distance: it puts the fine buckets where splats are
+// large on screen and ordering errors would show, and the coarse ones far away where 65534 uniform
+// buckets over a whole environment would be wasted. Unused when _UniKeyBits is 32.
+float4 _UniDepthParams;
+
+// Which slot of the shared view buffer output slot `slot` draws. Shared by the two kernels below
+// so the key build and the view-texture pack can never disagree about the mapping.
+uint UnifiedViewIndex(uint slot)
+{
+    // Largest region whose outOffset is <= slot. Regions are emitted in ascending outOffset with
+    // no gaps, so this is the region that owns this slot.
+    uint lo = 0, hi = _UniRegionCount - 1u;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi + 1u) >> 1;   // >= 1, so the hi = mid - 1 below cannot underflow
+        if (_UniRegions[mid].outOffset <= slot)
+            lo = mid;
+        else
+            hi = mid - 1u;
+    }
+
+    // Clamped: the region table is CPU-built and correct, but this is an address computed from
+    // buffer contents feeding an indexed read, and an out-of-range one page-faults on Metal rather
+    // than failing loudly.
+    return min(_UniRegions[lo].viewBase + (slot - _UniRegions[lo].outOffset), _UniViewCount - 1u);
+}
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSUnifiedBuildKeys (uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    // The region count guard is not defensive padding: at zero, the binary search's initial
+    // `_UniRegionCount - 1` underflows to 4 billion and the search walks off the table.
+    if (slot >= _UniCount || _UniRegionCount == 0u)
+        return;
+
+    uint idx = UnifiedViewIndex(slot);
+
+    // Camera-space depth, written for every splat by CSCalcViewData into the view struct's padding.
+    // Negative in front of the camera, so ascending = farthest first = back-to-front draw order.
+    float camZ = asfloat(_SplatViewData[idx].color.z);
+
+    uint key;
+    if (_UniKeyBits <= 16u)
+    {
+        float dist = max(-camZ, _UniDepthParams.z);
+        float t = saturate((1.0 / dist - _UniDepthParams.x) * _UniDepthParams.y);
+        key = (uint)(t * 65534.0 + 0.5);
+    }
+    else
+    {
+        key = FloatToSortableUint(camZ);
+    }
+
+    _SplatSortDistances[slot] = key;
+    _SplatSortKeys[slot] = idx;
+}
+
+// The unified twin of CSBuildViewTex: pack the merged draw order into the shared view texture for
+// the vertex-texture-fetch path (see the layout note on CSBuildViewTex, which this matches exactly).
+//
+// A near-copy rather than a reuse, and deliberately so: the original is driven by _SplatCount /
+// _SplatCountFull / _SplatViewTexWidth, which every per-object dispatch in the same command buffer
+// rewrites, and uniform updates between dispatches are not reliably honoured on ANGLE (the reason
+// _SortMatrixMV exists apart from _MatrixMV). Reading the merged count out of _Uni* uniforms that
+// nothing else touches removes that dependency instead of betting on it.
+RWTexture2D<uint4> _UniViewDataTex;
+uint _UniViewTexWidth;
+
+[numthreads(GROUP_SIZE,1,1)]
+void CSUnifiedBuildViewTex (uint3 id : SV_DispatchThreadID)
+{
+    uint p = id.x;
+    if (p >= _UniCount)
+        return;
+
+    // _SplatSortKeys holds the merged order here, so its entries are already indices into the
+    // shared view buffer. Clamped for the same reason the per-object kernel clamps.
+    uint idx = min(_SplatSortKeys[p], _UniViewCount - 1u);
+    SplatViewData view = _SplatViewData[idx];
+
+    uint baseTexel = p * 2u;
+    uint2 c0 = uint2(baseTexel % _UniViewTexWidth, baseTexel / _UniViewTexWidth);
+    uint2 c1 = uint2((baseTexel + 1u) % _UniViewTexWidth, (baseTexel + 1u) / _UniViewTexWidth);
+    _UniViewDataTex[c0] = asuint(view.pos);
+    _UniViewDataTex[c1] = uint4(
+        PackHalf2(view.axis.x, view.axis.y),
+        PackHalf2(view.axis.z, view.axis.w),
+        view.color.x,
+        view.color.y);
+}

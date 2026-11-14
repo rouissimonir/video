@@ -1,0 +1,30 @@
+{
+    "name": "Viggle.SplatEngine.Editor",
+    "rootNamespace": "Viggle.SplatEngine.Editor",
+    "references": [
+        "Viggle.SplatEngine.Jobs",
+        "Viggle.SplatEngine",
+        "GaussianSplatting",
+        "GaussianSplattingEditor",
+        "Unity.Mathematics",
+        "GUID:15fc0a57446b3144c949da3e2b9737a9",
+        "GUID:df380645f10b7bc4b97d4f5eb6303d95"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.render-pipelines.universal",
+            "expression": "",
+            "define": "GS_ENABLE_URP"
+        }
+    ],
+    "noEngineReferences": false
+}

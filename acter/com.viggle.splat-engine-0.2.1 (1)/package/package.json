@@ -1,0 +1,32 @@
+{
+  "name": "com.viggle.splat-engine",
+  "version": "0.2.1",
+  "displayName": "Viggle Splat Engine",
+  "description": "Render and skeletally animate Gaussian splat characters in Unity. Loads .vsplat character files (Gaussian splats plus per-splat bone weights and a rest skeleton) and drives them with standard Unity Humanoid animations via GPU linear blend skinning. Bundles a vendored copy of the Gaussian Splatting package (org.nesnausk.gaussian-splatting, MIT) under GaussianSplatting/, so no separate install is needed.",
+  "unity": "2022.3",
+  "author": {
+    "name": "Viggle / WarpEngine"
+  },
+  "keywords": [
+    "gaussian-splatting",
+    "splat",
+    "character",
+    "animation",
+    "skinning"
+  ],
+  "dependencies": {
+    "com.unity.burst": "1.8.8",
+    "com.unity.collections": "2.1.4",
+    "com.unity.mathematics": "1.2.6",
+    "com.unity.modules.xr": "1.0.0",
+    "com.unity.modules.vr": "1.0.0"
+  },
+  "samples": [
+    {
+      "displayName": "Examples",
+      "description": "Animated Gaussian-splat characters driven by a Unity Humanoid clip, with example visual effects: outline, tint, and colour/opacity. Import, open Examples/CharacterRender/SplatCharacterExample.unity, and press Play. See CharacterRender/EFFECTS.md.",
+      "path": "Samples~/Examples"
+    }
+  ],
+  "license": "MIT"
+}
